@@ -11,7 +11,6 @@ Outgoing (agent → media server):
 
 from __future__ import annotations
 
-import asyncio
 import audioop
 import base64
 import json

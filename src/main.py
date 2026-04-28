@@ -1,10 +1,22 @@
-"""Flow (1) entrypoint.
+"""End-to-end entrypoint for Flow (1): LiveAvatar hosts the LiveKit room.
 
-1. Call LiveAvatar API → mint session → receive LiveKit url + agent_token.
-2. Run AgentServer worker locally (unregistered, devmode).
-3. Inject the pre-minted LiveAvatar agent_token via simulate_job(token=...).
-   Worker connects to LiveAvatar's room w/ that token, full JobContext stack.
+Sequence:
+  1. POST /v1/sessions/token   → session_token JWT (LiveAvatarClient)
+  2. POST /v1/sessions/start   → livekit_url, livekit_agent_token,
+                                 livekit_client_token, ws_url
+  3. Run AgentServer locally (devmode, unregistered) and dispatch a single
+     job with the pre-minted livekit_agent_token via simulate_job(token=...).
+  4. The worker entrypoint (agent_dispatcher.my_agent) connects to the
+     LiveAvatar room, opens the avatar media-server WebSocket, and starts
+     the voice pipeline.
+  5. A local HTTP server hosts viewer/index.html and the browser auto-opens
+     to it w/ url+client_token preloaded so you can talk to the avatar.
+
+Stop with Ctrl-C. The worker drains, the LiveAvatar session is closed, and
+the local viewer server shuts down.
 """
+
+from __future__ import annotations
 
 import asyncio
 import base64
@@ -28,10 +40,25 @@ from liveavatar import LiveAvatarClient
 
 load_dotenv(".env.local")
 
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
+
+def _setup_logging() -> None:
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    )
+    root.addHandler(handler)
+    root.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
+
+    # Quiet down chatty third-party loggers.
+    for name in ("livekit", "websockets", "httpcore", "httpx"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+_setup_logging()
 logger = logging.getLogger("main")
 
 
@@ -39,10 +66,7 @@ VIEWER_DIR = Path(__file__).resolve().parent.parent / "viewer"
 
 
 def _serve_viewer() -> tuple[socketserver.TCPServer, int]:
-    """Static file server for viewer/ on a free port. Daemon thread."""
-    handler = functools.partial(
-        http.server.SimpleHTTPRequestHandler, directory=str(VIEWER_DIR)
-    )
+    """Serve viewer/ on a free localhost port. Returns (httpd, port)."""
 
     class _Quiet(http.server.SimpleHTTPRequestHandler):
         def log_message(self, *_args):  # silence access logs
@@ -57,13 +81,15 @@ def _serve_viewer() -> tuple[socketserver.TCPServer, int]:
 
 def _open_viewer(port: int, livekit_url: str, client_token: str) -> str:
     qs = urllib.parse.urlencode({"url": livekit_url, "token": client_token})
-    viewer_url = f"http://127.0.0.1:{port}/?{qs}"
-    webbrowser.open(viewer_url)
-    return viewer_url
+    url = f"http://127.0.0.1:{port}/?{qs}"
+    webbrowser.open(url)
+    return url
 
 
 def _decode_jwt_payload(token: str) -> dict:
-    """Decode JWT payload w/o signature verification. Used to extract room name."""
+    """Decode a JWT payload (middle segment) without signature verification.
+    Used to read the room name out of the LiveAvatar agent token.
+    """
     parts = token.split(".")
     if len(parts) < 2:
         raise ValueError("invalid jwt")
@@ -76,7 +102,7 @@ async def run() -> None:
     avatar_id = os.environ["AVATAR_ID"]
     base_url = os.environ.get("LIVEAVATAR_BASE_URL") or "https://api.liveavatar.com"
 
-    # Step 1+2: mint LiveAvatar session
+    # 1+2. Mint a LiveAvatar session.
     async with LiveAvatarClient(api_key=api_key, base_url=base_url) as la:
         token_resp = await la.create_session_token(avatar_id=avatar_id)
         logger.info("session_token created session_id=%s", token_resp.session_id)
@@ -88,21 +114,25 @@ async def run() -> None:
             started.ws_url,
             started.session_id,
         )
-        # Viewer joins same room w/ this token.
-        logger.info("viewer livekit_client_token=%s", started.livekit_client_token)
 
-    # Spin up viewer + auto-open browser
+    if not started.ws_url:
+        raise RuntimeError(
+            "LiveAvatar start_session did not return ws_url; cannot drive avatar."
+        )
+
+    # Viewer
     httpd, port = _serve_viewer()
     viewer_url = _open_viewer(port, started.livekit_url, started.livekit_client_token)
-    logger.info("viewer opened at %s", viewer_url)
+    logger.info("viewer opened: %s", viewer_url)
 
-    # Extract room name from the agent JWT (LiveAvatar puts it in `video.room`).
+    # 3. Configure the agent worker.
     payload = _decode_jwt_payload(started.livekit_agent_token)
     room_name = payload["video"]["room"]
     logger.info("agent_token room=%s identity=%s", room_name, payload.get("sub"))
 
-    # Step 3: configure + run worker. Inject the LiveAvatar agent_token.
     server.update_options(ws_url=started.livekit_url)
+    # The worker subprocess reads this to open the LiveAvatar media-server WS.
+    os.environ["LIVEAVATAR_WS_URL"] = started.ws_url
 
     @server.once("worker_started")
     def _dispatch_job() -> None:
@@ -116,6 +146,7 @@ async def run() -> None:
 
         asyncio.create_task(_go())
 
+    # 4. Run the worker until Ctrl-C / SIGTERM, then shut down gracefully.
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -127,9 +158,7 @@ async def run() -> None:
     waiter = asyncio.create_task(stop.wait(), name="stop-waiter")
 
     try:
-        await asyncio.wait(
-            {runner, waiter}, return_when=asyncio.FIRST_COMPLETED
-        )
+        await asyncio.wait({runner, waiter}, return_when=asyncio.FIRST_COMPLETED)
     finally:
         waiter.cancel()
         if not runner.done():
@@ -145,23 +174,21 @@ async def run() -> None:
             try:
                 await asyncio.wait_for(runner, timeout=15)
             except asyncio.TimeoutError:
-                logger.warning("runner did not exit, cancelling")
                 runner.cancel()
                 try:
                     await runner
                 except (asyncio.CancelledError, Exception):
                     pass
 
-    httpd.shutdown()
+        httpd.shutdown()
 
-    # Cleanup the LiveAvatar session
-    async with LiveAvatarClient(api_key=api_key, base_url=base_url) as la:
-        try:
-            await la.stop_session(
-                token_resp.session_token, session_id=started.session_id
-            )
-        except Exception as e:
-            logger.warning("stop_session failed: %s", e)
+        async with LiveAvatarClient(api_key=api_key, base_url=base_url) as la:
+            try:
+                await la.stop_session(
+                    token_resp.session_token, session_id=started.session_id
+                )
+            except Exception as e:
+                logger.warning("stop_session failed: %s", e)
 
 
 if __name__ == "__main__":

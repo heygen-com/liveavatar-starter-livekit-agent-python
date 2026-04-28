@@ -1,7 +1,30 @@
+"""LiveKit AgentServer wiring.
+
+Defines the worker process: prewarm hook (loads VAD), the voice pipeline
+factory, and the @server.rtc_session entrypoint that runs per job.
+
+The same entrypoint serves two flows:
+
+  * Flow 1 — LiveAvatar hosts the LiveKit room.
+    main.py mints a LiveAvatar session, then dispatches a single job to this
+    worker via AgentServer.simulate_job(token=...). Run with `python src/main.py`.
+
+  * Flow 2 — we own the LiveKit room.
+    Run this module directly (`python src/agent_dispatcher.py dev`) to register
+    with LiveKit Cloud and accept dispatched jobs by agent_name.
+
+The LiveAvatar media-server WebSocket URL is passed in via the
+`LIVEAVATAR_WS_URL` environment variable so the entrypoint can open the WS
+and start forwarding TTS audio to drive the avatar's lip-sync.
+"""
+
+from __future__ import annotations
+
 import logging
 import os
 
 from dotenv import load_dotenv
+from livekit import rtc
 from livekit.agents import (
     AgentServer,
     AgentSession,
@@ -25,8 +48,10 @@ AGENT_MODEL = "openai/gpt-5.3-chat-latest"
 
 
 def build_session(vad) -> AgentSession:
-    """Voice pipeline. STT → LLM → TTS + VAD + multilingual turn detection.
-    Plugins pull a shared http session from JobContext.
+    """Construct the voice pipeline: STT → LLM → TTS + VAD + turn detection.
+
+    Plugins pick up a shared aiohttp.ClientSession from the JobContext, which
+    is why this must run inside an agent worker process.
     """
     return AgentSession(
         stt=inference.STT(model="deepgram/nova-3", language="multi"),
@@ -41,6 +66,11 @@ def build_session(vad) -> AgentSession:
 
 
 def build_room_options() -> room_io.RoomOptions:
+    """Audio input options. We keep audio_output enabled so the AgentSession
+    actually runs the TTS pipeline (and our tts_node override fires); the
+    raw track it publishes is muted in `local_track_published` below to
+    avoid double audio in the room.
+    """
     return room_io.RoomOptions(
         audio_input=room_io.AudioInputOptions(
             noise_cancellation=ai_coustics.audio_enhancement(
@@ -50,12 +80,13 @@ def build_room_options() -> room_io.RoomOptions:
     )
 
 
-# ---- AgentServer (worker) ----
+# ---- AgentServer (worker) ----------------------------------------------------
 
 server = AgentServer()
 
 
-def prewarm(proc: JobProcess):
+def prewarm(proc: JobProcess) -> None:
+    """Runs once per worker subprocess before any job is assigned."""
     proc.userdata["vad"] = silero.VAD.load()
 
 
@@ -63,14 +94,38 @@ server.setup_fnc = prewarm
 
 
 @server.rtc_session(agent_name="my-agent")
-async def my_agent(ctx: JobContext):
-    """Job entrypoint. Used by:
-      - Flow 1: AgentServer.simulate_job(token=...) (pre-minted LiveAvatar token)
-      - Flow 2: LK Cloud dispatch (registered worker)
-    """
+async def my_agent(ctx: JobContext) -> None:
     ctx.log_context_fields = {"room": ctx.room.name}
 
-    # ---------- observability hooks ----------
+    _wire_observability(ctx)
+    _mute_agent_audio_on_publish(ctx)
+
+    # Open the LiveAvatar media-server WebSocket. main.py populates this env
+    # var from LiveAvatarClient.start_session() before launching the worker.
+    ws_url = os.environ.get("LIVEAVATAR_WS_URL")
+    if not ws_url:
+        raise RuntimeError(
+            "LIVEAVATAR_WS_URL env var not set. main.py must populate it from "
+            "LiveAvatarClient.start_session() before launching the worker."
+        )
+    avatar_ws = AvatarWebSocket(ws_url=ws_url)
+    await avatar_ws.connect()
+    ctx.add_shutdown_callback(avatar_ws.close)
+
+    session = build_session(ctx.proc.userdata["vad"])
+    _wire_session_observability(session)
+
+    await session.start(
+        agent=LiveAvatarAgent(avatar_ws=avatar_ws),
+        room=ctx.room,
+        room_options=build_room_options(),
+    )
+
+    await ctx.connect()
+
+
+def _wire_observability(ctx: JobContext) -> None:
+    """Log key room events so it's easy to see what's happening at runtime."""
     room = ctx.room
 
     @room.on("participant_connected")
@@ -94,8 +149,8 @@ async def my_agent(ctx: JobContext):
     def _on_disconnected(reason=None):
         logger.info("room disconnected reason=%s", reason)
 
-    session = build_session(ctx.proc.userdata["vad"])
 
+def _wire_session_observability(session: AgentSession) -> None:
     @session.on("user_input_transcribed")
     def _on_user_input(ev):
         logger.info(
@@ -112,30 +167,22 @@ async def my_agent(ctx: JobContext):
             getattr(ev, "new_state", None),
         )
 
-    # ---------- LiveAvatar media-server WebSocket ----------
-    # ws_url passed via env from main.py before server.run().
-    ws_url = os.environ.get("LIVEAVATAR_WS_URL")
-    if not ws_url:
-        raise RuntimeError(
-            "LIVEAVATAR_WS_URL env var not set. main.py must populate it from "
-            "LiveAvatarClient.start_session() before launching the worker."
-        )
-    avatar_ws = AvatarWebSocket(ws_url=ws_url)
-    await avatar_ws.connect()
 
-    async def _close_avatar_ws():
-        await avatar_ws.close()
+def _mute_agent_audio_on_publish(ctx: JobContext) -> None:
+    """The avatar (driven via WebSocket) publishes the synced voice track.
+    Mute the agent's raw TTS track right after it's published so the room
+    doesn't carry double audio.
+    """
 
-    ctx.add_shutdown_callback(_close_avatar_ws)
-
-    await session.start(
-        agent=LiveAvatarAgent(avatar_ws=avatar_ws),
-        room=ctx.room,
-        room_options=build_room_options(),
-    )
-
-    await ctx.connect()
+    @ctx.room.on("local_track_published")
+    def _on_local_track_published(pub, track):
+        if pub.kind == rtc.TrackKind.KIND_AUDIO and isinstance(
+            track, rtc.LocalAudioTrack
+        ):
+            track.mute()
+            logger.info("muted local agent audio track sid=%s", pub.sid)
 
 
 if __name__ == "__main__":
+    # Flow 2 entrypoint: register with LiveKit Cloud and accept jobs.
     cli.run_app(server)

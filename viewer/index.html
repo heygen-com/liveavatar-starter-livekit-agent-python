@@ -54,6 +54,9 @@
           <button type="submit" id="connect-btn">Connect</button>
           <button type="button" id="disconnect-btn" disabled>Disconnect</button>
         </div>
+        <div class="row">
+          <button type="button" id="mic-btn" disabled>Mic: off</button>
+        </div>
         <div class="status" id="status">idle</div>
       </form>
       <section class="stage">
@@ -75,6 +78,7 @@
       const tokenEl = $('token');
       const connectBtn = $('connect-btn');
       const disconnectBtn = $('disconnect-btn');
+      const micBtn = $('mic-btn');
       const videoEl = $('remote-video');
       const audioEl = $('remote-audio');
 
@@ -125,6 +129,8 @@
             status('disconnected');
             connectBtn.disabled = false;
             disconnectBtn.disabled = true;
+            micBtn.disabled = true;
+            micBtn.textContent = 'Mic: off';
           })
           .on(RoomEvent.ParticipantConnected, (p) => {
             status(`participant joined: ${p.identity}`);
@@ -134,6 +140,16 @@
           await room.connect(url, token);
           status(`connected to ${room.name} as ${room.localParticipant.identity}`);
           disconnectBtn.disabled = false;
+          micBtn.disabled = false;
+
+          // Auto-enable mic on connect so the agent can hear you.
+          try {
+            await room.localParticipant.setMicrophoneEnabled(true);
+            micBtn.textContent = 'Mic: on';
+          } catch (err) {
+            console.warn('mic enable failed', err);
+            status(`mic error: ${err.message}`);
+          }
 
           // Attach already-published tracks from existing remote participants
           for (const p of room.remoteParticipants.values()) {
@@ -155,6 +171,12 @@
 
       $('connect-form').addEventListener('submit', connect);
       disconnectBtn.addEventListener('click', disconnect);
+      micBtn.addEventListener('click', async () => {
+        if (!room) return;
+        const enabled = room.localParticipant.isMicrophoneEnabled;
+        await room.localParticipant.setMicrophoneEnabled(!enabled);
+        micBtn.textContent = `Mic: ${!enabled ? 'on' : 'off'}`;
+      });
 
       if (autoConnect && urlEl.value && tokenEl.value && (qpUrl || qpToken)) {
         $('connect-form').requestSubmit();

@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agent-starter-python"
-version = "1.0.0"
-description = "Simple voice AI assistant built with LiveKit Agents for Python"
+name = "liveavatar-starter-livekit-agent-python"
+version = "0.1.0"
+description = "LiveAvatar × LiveKit Agents starter (Python)"
 requires-python = ">=3.10, <3.15"
 
 dependencies = [
@@ -13,6 +13,8 @@ dependencies = [
     "livekit-plugins-ai-coustics~=0.2",
     "python-dotenv",
     "httpx",
+    "websockets",
+    "audioop-lts; python_version >= '3.13'",
 ]
 
 [dependency-groups]

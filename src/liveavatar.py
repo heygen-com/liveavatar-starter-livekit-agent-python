@@ -1,14 +1,19 @@
-"""LiveAvatar API client. Docs: https://docs.liveavatar.com/api-reference"""
+"""Minimal async client for the LiveAvatar HTTP API.
+
+Docs: https://docs.liveavatar.com/api-reference
+
+Covers the three endpoints needed for Flow (1):
+  * POST /v1/sessions/token  — mint a session JWT
+  * POST /v1/sessions/start  — get LiveKit + media-server connection info
+  * POST /v1/sessions/stop   — end the session
+"""
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
-
-logger = logging.getLogger("liveavatar")
 
 DEFAULT_BASE_URL = "https://api.liveavatar.com"
 
