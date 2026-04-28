@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LiveAvatar Viewer</title>
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+        background: #0b0b0e;
+        color: #e7e7ea;
+      }
+      header { padding: 12px 16px; border-bottom: 1px solid #222; }
+      h1 { margin: 0; font-size: 16px; font-weight: 600; }
+      main { display: grid; grid-template-columns: 360px 1fr; gap: 16px; padding: 16px; }
+      form { display: flex; flex-direction: column; gap: 8px; }
+      label { font-size: 12px; color: #9aa; }
+      input, textarea, button {
+        font: inherit;
+        padding: 8px 10px;
+        border-radius: 6px;
+        border: 1px solid #2a2a30;
+        background: #15161b;
+        color: inherit;
+      }
+      textarea { min-height: 110px; resize: vertical; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+      button { cursor: pointer; background: #2a6df4; border-color: #2a6df4; }
+      button[disabled] { opacity: 0.5; cursor: not-allowed; }
+      .stage {
+        background: #000;
+        border-radius: 10px;
+        aspect-ratio: 16 / 9;
+        overflow: hidden;
+        display: grid;
+        place-items: center;
+      }
+      video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+      .status { font-size: 12px; color: #9aa; min-height: 1.4em; }
+      .row { display: flex; gap: 8px; }
+      .row > * { flex: 1; }
+    </style>
+  </head>
+  <body>
+    <header><h1>LiveAvatar Viewer</h1></header>
+    <main>
+      <form id="connect-form">
+        <label for="url">LiveKit URL</label>
+        <input id="url" placeholder="wss://..." autocomplete="off" />
+        <label for="token">Client Token</label>
+        <textarea id="token" placeholder="paste livekit_client_token" autocomplete="off"></textarea>
+        <div class="row">
+          <button type="submit" id="connect-btn">Connect</button>
+          <button type="button" id="disconnect-btn" disabled>Disconnect</button>
+        </div>
+        <div class="status" id="status">idle</div>
+      </form>
+      <section class="stage">
+        <video id="remote-video" autoplay playsinline></video>
+      </section>
+    </main>
+    <audio id="remote-audio" autoplay></audio>
+    <script type="module">
+      import {
+        Room,
+        RoomEvent,
+        Track,
+      } from 'https://cdn.skypack.dev/livekit-client@2';
+
+      const $ = (id) => document.getElementById(id);
+      const status = (msg) => { $('status').textContent = msg; };
+
+      const urlEl = $('url');
+      const tokenEl = $('token');
+      const connectBtn = $('connect-btn');
+      const disconnectBtn = $('disconnect-btn');
+      const videoEl = $('remote-video');
+      const audioEl = $('remote-audio');
+
+      // Prefer query string (auto-handoff from main.py), fall back to localStorage.
+      const params = new URLSearchParams(location.search);
+      const qpUrl = params.get('url');
+      const qpToken = params.get('token');
+      const autoConnect = params.get('auto') !== '0';
+      urlEl.value = qpUrl || localStorage.getItem('lk_url') || '';
+      tokenEl.value = qpToken || localStorage.getItem('lk_token') || '';
+
+      let room = null;
+
+      function attachTrack(track) {
+        if (track.kind === Track.Kind.Video) {
+          track.attach(videoEl);
+        } else if (track.kind === Track.Kind.Audio) {
+          track.attach(audioEl);
+        }
+      }
+
+      function detachTrack(track) {
+        track.detach().forEach((el) => { el.srcObject = null; });
+      }
+
+      async function connect(e) {
+        e.preventDefault();
+        const url = urlEl.value.trim();
+        const token = tokenEl.value.trim();
+        if (!url || !token) return;
+        localStorage.setItem('lk_url', url);
+        localStorage.setItem('lk_token', token);
+
+        connectBtn.disabled = true;
+        status('connecting...');
+
+        room = new Room({ adaptiveStream: true, dynacast: true });
+
+        room
+          .on(RoomEvent.TrackSubscribed, (track) => {
+            status(`track subscribed: ${track.kind} from ${track.sid}`);
+            attachTrack(track);
+          })
+          .on(RoomEvent.TrackUnsubscribed, (track) => {
+            detachTrack(track);
+          })
+          .on(RoomEvent.Disconnected, () => {
+            status('disconnected');
+            connectBtn.disabled = false;
+            disconnectBtn.disabled = true;
+          })
+          .on(RoomEvent.ParticipantConnected, (p) => {
+            status(`participant joined: ${p.identity}`);
+          });
+
+        try {
+          await room.connect(url, token);
+          status(`connected to ${room.name} as ${room.localParticipant.identity}`);
+          disconnectBtn.disabled = false;
+
+          // Attach already-published tracks from existing remote participants
+          for (const p of room.remoteParticipants.values()) {
+            for (const pub of p.trackPublications.values()) {
+              if (pub.track) attachTrack(pub.track);
+            }
+          }
+        } catch (err) {
+          console.error(err);
+          status(`error: ${err.message}`);
+          connectBtn.disabled = false;
+        }
+      }
+
+      async function disconnect() {
+        if (room) await room.disconnect();
+        room = null;
+      }
+
+      $('connect-form').addEventListener('submit', connect);
+      disconnectBtn.addEventListener('click', disconnect);
+
+      if (autoConnect && urlEl.value && tokenEl.value && (qpUrl || qpToken)) {
+        $('connect-form').requestSubmit();
+      }
+    </script>
+  </body>
+</html>

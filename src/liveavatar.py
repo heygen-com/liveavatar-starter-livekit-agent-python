@@ -1,0 +1,116 @@
+"""LiveAvatar API client. Docs: https://docs.liveavatar.com/api-reference"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Any
+
+import httpx
+
+logger = logging.getLogger("liveavatar")
+
+DEFAULT_BASE_URL = "https://api.liveavatar.com"
+
+
+@dataclass
+class SessionToken:
+    session_id: str
+    session_token: str
+
+
+@dataclass
+class StartedSession:
+    session_id: str
+    livekit_url: str
+    livekit_agent_token: str
+    livekit_client_token: str
+    max_session_duration: int | None = None
+    ws_url: str | None = None
+
+
+class LiveAvatarClient:
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str = DEFAULT_BASE_URL,
+        timeout: float = 30.0,
+    ):
+        self._api_key = api_key
+        self._base_url = base_url.rstrip("/")
+        self._http = httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=timeout,
+            headers={"X-API-KEY": api_key},
+        )
+
+    async def aclose(self) -> None:
+        await self._http.aclose()
+
+    async def __aenter__(self) -> "LiveAvatarClient":
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.aclose()
+
+    async def create_session_token(
+        self,
+        avatar_id: str,
+        *,
+        is_sandbox: bool = False,
+        max_session_duration: int | None = None,
+        video_quality: str = "high",
+        video_encoding: str = "H264",
+    ) -> SessionToken:
+        """LITE mode, no livekit_config — LiveAvatar hosts the room."""
+        body: dict[str, Any] = {
+            "mode": "LITE",
+            "avatar_id": avatar_id,
+            "is_sandbox": is_sandbox,
+            "video_settings": {
+                "quality": video_quality,
+                "encoding": video_encoding,
+            },
+        }
+        if max_session_duration is not None:
+            body["max_session_duration"] = max_session_duration
+
+        resp = await self._http.post("/v1/sessions/token", json=body)
+        resp.raise_for_status()
+        data = resp.json()["data"]
+        return SessionToken(
+            session_id=data["session_id"],
+            session_token=data["session_token"],
+        )
+
+    async def start_session(self, session_token: str) -> StartedSession:
+        """Bearer auth w/ session_token. Returns LiveKit connection info."""
+        resp = await self._http.post(
+            "/v1/sessions/start",
+            headers={"Authorization": f"Bearer {session_token}"},
+            json={},
+        )
+        resp.raise_for_status()
+        data = resp.json()["data"]
+        return StartedSession(
+            session_id=data["session_id"],
+            livekit_url=data["livekit_url"],
+            livekit_agent_token=data["livekit_agent_token"],
+            livekit_client_token=data["livekit_client_token"],
+            max_session_duration=data.get("max_session_duration"),
+            ws_url=data.get("ws_url"),
+        )
+
+    async def stop_session(
+        self,
+        session_token: str,
+        *,
+        session_id: str,
+        reason: str = "USER_CLOSED",
+    ) -> None:
+        resp = await self._http.post(
+            "/v1/sessions/stop",
+            headers={"Authorization": f"Bearer {session_token}"},
+            json={"session_id": session_id, "reason": reason},
+        )
+        resp.raise_for_status()
