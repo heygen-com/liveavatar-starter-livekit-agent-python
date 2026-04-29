@@ -52,6 +52,10 @@ logger = logging.getLogger("agent")
 load_dotenv(".env.local")
 
 
+# Worker registers under this name; the BYO demo dispatches to the same name.
+# Rename to something specific to your project (e.g. "support-agent",
+# "tutor-bot") before deploying — generic "my-agent" entries pile up across
+# LK Cloud accounts and make logs harder to grep.
 AGENT_NAME = "my-agent"
 
 server = AgentServer()

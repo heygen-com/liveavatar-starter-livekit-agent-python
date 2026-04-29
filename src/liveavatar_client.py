@@ -52,7 +52,7 @@ class LiveAvatarClient:
     async def aclose(self) -> None:
         await self._http.aclose()
 
-    async def __aenter__(self) -> "LiveAvatarClient":
+    async def __aenter__(self) -> LiveAvatarClient:
         return self
 
     async def __aexit__(self, *exc) -> None:
@@ -107,7 +107,11 @@ class LiveAvatarClient:
             headers={"Authorization": f"Bearer {session_token}"},
             json={},
         )
-        resp.raise_for_status()
+        if resp.is_error:
+            raise RuntimeError(
+                f"start_session failed status={resp.status_code} "
+                f"body={resp.text!r}"
+            )
         data = resp.json()["data"]
         return StartedSession(
             session_id=data["session_id"],
@@ -142,4 +146,8 @@ class LiveAvatarClient:
             headers=headers,
             json={"session_id": session_id, "reason": reason},
         )
-        resp.raise_for_status()
+        if resp.is_error:
+            raise RuntimeError(
+                f"stop_session failed status={resp.status_code} "
+                f"body={resp.text!r} session_id={session_id}"
+            )

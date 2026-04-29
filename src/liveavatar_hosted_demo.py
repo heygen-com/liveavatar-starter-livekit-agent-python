@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import functools
 import http.server
 import json
@@ -40,8 +41,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from livekit.protocol import models
 
-from worker import server, simulate_job_with_metadata
 from liveavatar_client import LiveAvatarClient
+from worker import server, simulate_job_with_metadata
 
 load_dotenv(".env.local")
 
@@ -134,6 +135,8 @@ async def run() -> None:
 
     server.update_options(ws_url=started.livekit_url)
 
+    dispatch_task: asyncio.Task | None = None
+
     @server.once("worker_started")
     def _dispatch_job() -> None:
         async def _go() -> None:
@@ -147,7 +150,8 @@ async def run() -> None:
             )
             logger.info("simulate_job dispatched")
 
-        asyncio.create_task(_go())
+        nonlocal dispatch_task
+        dispatch_task = asyncio.create_task(_go(), name="simulate-job-dispatch")
 
     # 4. Run the worker until Ctrl-C / SIGTERM, then shut down gracefully.
     stop = asyncio.Event()
@@ -178,10 +182,8 @@ async def run() -> None:
                 await asyncio.wait_for(runner, timeout=15)
             except asyncio.TimeoutError:
                 runner.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await runner
-                except (asyncio.CancelledError, Exception):
-                    pass
 
         httpd.shutdown()
 

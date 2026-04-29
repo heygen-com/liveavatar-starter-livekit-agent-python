@@ -5,6 +5,21 @@ Minimal Python boilerplate for driving a HeyGen
 [LiveKit Agents](https://docs.livekit.io/agents/) voice pipeline. Talk into
 your browser, the agent thinks, the avatar lip-syncs the response.
 
+## Quickstart
+
+```bash
+uv venv && source .venv/bin/activate
+uv pip install -e .
+python src/worker.py download-files
+cp .env.example .env.local                 # then fill in your API keys
+python src/liveavatar_hosted_demo.py       # talks to a sample avatar in your default browser
+```
+
+This runs the **LiveAvatar-hosted demo** (Flow 1) — fastest path, no
+LiveKit Cloud worker deploy required. For the production-shaped path
+(your LK Cloud project, `lk agent deploy`), see the
+[BYO LiveKit demo](./docs/byo-livekit-demo.md).
+
 ## Two demos, two ops models
 
 There are two integration modes for connecting a LiveKit agent to LiveAvatar.

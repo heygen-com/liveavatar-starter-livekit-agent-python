@@ -8,10 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from typing import AsyncIterable
-
-WS_CLEANUP_TIMEOUT = 0.5  # seconds — bound interrupt/finish sends so a slow
-# avatar WS doesn't blow the 5s LK Agents speech-cancel budget.
+from collections.abc import AsyncIterable
 
 from livekit import rtc
 from livekit.agents import Agent, ModelSettings
@@ -19,6 +16,10 @@ from livekit.agents import Agent, ModelSettings
 from avatar_ws import AvatarWebSocket
 
 logger = logging.getLogger("agent")
+
+# Bound interrupt/finish sends so a slow avatar WS doesn't blow the 5s
+# LK Agents speech-cancel budget.
+WS_CLEANUP_TIMEOUT = 0.5  # seconds
 
 
 class LiveAvatarAgent(Agent):
