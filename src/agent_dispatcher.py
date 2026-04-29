@@ -1,92 +1,55 @@
 """LiveKit AgentServer wiring.
 
-Defines the worker process: prewarm hook (loads VAD), the voice pipeline
-factory, and the @server.rtc_session entrypoint that runs per job.
+Defines the worker process: prewarm hook (loads VAD), the @server.rtc_session
+entrypoint, and a small `simulate_job_with_metadata` helper used by Flow 1.
 
-The same entrypoint serves two flows:
+Both flows run inside an AgentServer worker subprocess and deliver the
+LiveAvatar media-server WS URL through job metadata as a JSON blob:
+    {"ws_url": "wss://..."}.
 
   * Flow 1 — LiveAvatar hosts the LiveKit room.
     main.py mints a LiveAvatar session, then dispatches a single job to this
-    worker via AgentServer.simulate_job(token=...). Run with `python src/main.py`.
+    worker via simulate_job_with_metadata(token=..., metadata=...).
+    Run with `python src/main.py`.
 
   * Flow 2 — we own the LiveKit room.
-    Run this module directly (`python src/agent_dispatcher.py dev`) to register
-    with LiveKit Cloud and accept dispatched jobs by agent_name.
-
-The LiveAvatar media-server WebSocket URL is passed in via the
-`LIVEAVATAR_WS_URL` environment variable so the entrypoint can open the WS
-and start forwarding TTS audio to drive the avatar's lip-sync.
+    Run this module directly (`python src/agent_dispatcher.py dev`) to
+    register with LiveKit Cloud and accept dispatched jobs by agent_name.
+    example_flow_v2.py drives dispatch via AgentDispatchService.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-import os
 
 from dotenv import load_dotenv
-from livekit import rtc
-from livekit.agents import (
-    AgentServer,
-    AgentSession,
-    JobContext,
-    JobProcess,
-    cli,
-    inference,
-    room_io,
-)
-from livekit.plugins import ai_coustics, silero
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from livekit import api as lkapi
+from livekit.agents import AgentServer, JobContext, JobProcess, cli
+from livekit.agents.job import JobAcceptArguments, RunningJobInfo
+from livekit.plugins import silero
+from livekit.protocol import agent as agent_proto
+from livekit.protocol import models
 
 from agent import LiveAvatarAgent
 from avatar_ws import AvatarWebSocket
+from pipeline import (
+    build_room_options,
+    build_session,
+    mute_agent_audio_on_publish,
+    wire_room_observability,
+    wire_session_observability,
+)
 
 logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
 
-AGENT_MODEL = "openai/gpt-5.3-chat-latest"
-
-
-def build_session(vad) -> AgentSession:
-    """Construct the voice pipeline: STT → LLM → TTS + VAD + turn detection.
-
-    Plugins pick up a shared aiohttp.ClientSession from the JobContext, which
-    is why this must run inside an agent worker process.
-    """
-    return AgentSession(
-        stt=inference.STT(model="deepgram/nova-3", language="multi"),
-        llm=inference.LLM(model=AGENT_MODEL),
-        tts=inference.TTS(
-            model="cartesia/sonic-3", voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
-        ),
-        turn_detection=MultilingualModel(),
-        vad=vad,
-        preemptive_generation=True,
-    )
-
-
-def build_room_options() -> room_io.RoomOptions:
-    """Audio input options. We keep audio_output enabled so the AgentSession
-    actually runs the TTS pipeline (and our tts_node override fires); the
-    raw track it publishes is muted in `local_track_published` below to
-    avoid double audio in the room.
-    """
-    return room_io.RoomOptions(
-        audio_input=room_io.AudioInputOptions(
-            noise_cancellation=ai_coustics.audio_enhancement(
-                model=ai_coustics.EnhancerModel.QUAIL_VF_L
-            ),
-        ),
-    )
-
-
-# ---- AgentServer (worker) ----------------------------------------------------
 
 server = AgentServer()
 
 
 def prewarm(proc: JobProcess) -> None:
-    """Runs once per worker subprocess before any job is assigned."""
     proc.userdata["vad"] = silero.VAD.load()
 
 
@@ -97,23 +60,26 @@ server.setup_fnc = prewarm
 async def my_agent(ctx: JobContext) -> None:
     ctx.log_context_fields = {"room": ctx.room.name}
 
-    _wire_observability(ctx)
-    _mute_agent_audio_on_publish(ctx)
+    wire_room_observability(ctx.room)
+    mute_agent_audio_on_publish(ctx.room)
 
-    # Open the LiveAvatar media-server WebSocket. main.py populates this env
-    # var from LiveAvatarClient.start_session() before launching the worker.
-    ws_url = os.environ.get("LIVEAVATAR_WS_URL")
+    raw_meta = (ctx.job.metadata or "").strip()
+    if not raw_meta:
+        raise RuntimeError("Job metadata missing; expected JSON with ws_url.")
+    try:
+        meta = json.loads(raw_meta)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Job metadata is not valid JSON: {raw_meta!r}") from e
+    ws_url = meta.get("ws_url")
     if not ws_url:
-        raise RuntimeError(
-            "LIVEAVATAR_WS_URL env var not set. main.py must populate it from "
-            "LiveAvatarClient.start_session() before launching the worker."
-        )
+        raise RuntimeError("Job metadata missing 'ws_url'.")
+
     avatar_ws = AvatarWebSocket(ws_url=ws_url)
     await avatar_ws.connect()
     ctx.add_shutdown_callback(avatar_ws.close)
 
     session = build_session(ctx.proc.userdata["vad"])
-    _wire_session_observability(session)
+    wire_session_observability(session)
 
     await session.start(
         agent=LiveAvatarAgent(avatar_ws=avatar_ws),
@@ -124,65 +90,46 @@ async def my_agent(ctx: JobContext) -> None:
     await ctx.connect()
 
 
-def _wire_observability(ctx: JobContext) -> None:
-    """Log key room events so it's easy to see what's happening at runtime."""
-    room = ctx.room
+async def simulate_job_with_metadata(
+    *,
+    room: str,
+    token: str,
+    metadata: str,
+    room_info: models.Room | None = None,
+) -> None:
+    """Variant of AgentServer.simulate_job that injects Job.metadata.
 
-    @room.on("participant_connected")
-    def _on_participant_connected(p):
-        logger.info("participant_connected identity=%s kind=%s", p.identity, p.kind)
+    Used by Flow 1 (main.py) so the worker entrypoint can read the LiveAvatar
+    ws_url from `ctx.job.metadata` — same code path as Flow 2 dispatch.
 
-    @room.on("participant_disconnected")
-    def _on_participant_disconnected(p):
-        logger.info("participant_disconnected identity=%s", p.identity)
-
-    @room.on("track_subscribed")
-    def _on_track_subscribed(track, pub, p):
-        logger.info(
-            "track_subscribed kind=%s sid=%s from=%s",
-            track.kind,
-            track.sid,
-            p.identity,
-        )
-
-    @room.on("disconnected")
-    def _on_disconnected(reason=None):
-        logger.info("room disconnected reason=%s", reason)
-
-
-def _wire_session_observability(session: AgentSession) -> None:
-    @session.on("user_input_transcribed")
-    def _on_user_input(ev):
-        logger.info(
-            "user_input_transcribed final=%s text=%r",
-            getattr(ev, "is_final", None),
-            getattr(ev, "transcript", None),
-        )
-
-    @session.on("agent_state_changed")
-    def _on_agent_state(ev):
-        logger.info(
-            "agent_state %s -> %s",
-            getattr(ev, "old_state", None),
-            getattr(ev, "new_state", None),
-        )
-
-
-def _mute_agent_audio_on_publish(ctx: JobContext) -> None:
-    """The avatar (driven via WebSocket) publishes the synced voice track.
-    Mute the agent's raw TTS track right after it's published so the room
-    doesn't carry double audio.
+    Touches a few private AgentServer attrs (`_id`, `_ws_url`, `_proc_pool`).
+    Upstream simulate_job builds the Job internally and doesn't expose
+    metadata; this helper mirrors its body and adds the field.
     """
+    agent_identity = (
+        lkapi.TokenVerifier().verify(token, verify_signature=False).identity
+    )
+    if room_info is None:
+        room_info = models.Room(name=room, sid=f"SRM_{room}")
 
-    @ctx.room.on("local_track_published")
-    def _on_local_track_published(pub, track):
-        if pub.kind == rtc.TrackKind.KIND_AUDIO and isinstance(
-            track, rtc.LocalAudioTrack
-        ):
-            track.mute()
-            logger.info("muted local agent audio track sid=%s", pub.sid)
+    job = agent_proto.Job(
+        id=f"job-sim-{room}",
+        room=room_info,
+        type=agent_proto.JobType.JT_ROOM,
+        metadata=metadata,
+    )
+    running = RunningJobInfo(
+        worker_id=server._id,
+        accept_arguments=JobAcceptArguments(
+            identity=agent_identity, name="", metadata=""
+        ),
+        job=job,
+        url=server._ws_url,
+        token=token,
+        fake_job=False,
+    )
+    await server._proc_pool.launch_job(running)
 
 
 if __name__ == "__main__":
-    # Flow 2 entrypoint: register with LiveKit Cloud and accept jobs.
     cli.run_app(server)

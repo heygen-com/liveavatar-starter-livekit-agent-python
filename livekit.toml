@@ -1,0 +1,13 @@
+# LiveKit Cloud agent deploy manifest.
+# Used by `lk agent create` / `lk agent deploy`.
+# Docs: https://docs.livekit.io/agents/ops/deployment/
+
+[project]
+subdomain = ""  # filled by `lk agent create` on first deploy
+
+[agent]
+id = ""  # filled by `lk agent create` on first deploy
+
+[build]
+# Use the bundled Dockerfile to build the worker image.
+dockerfile = "Dockerfile"

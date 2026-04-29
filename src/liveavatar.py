@@ -66,8 +66,14 @@ class LiveAvatarClient:
         max_session_duration: int | None = None,
         video_quality: str = "high",
         video_encoding: str = "H264",
+        livekit_config: dict[str, str] | None = None,
     ) -> SessionToken:
-        """LITE mode, no livekit_config — LiveAvatar hosts the room."""
+        """LITE mode session.
+
+        Without `livekit_config`: LiveAvatar provisions the LiveKit room (Flow 1).
+        With `livekit_config` ({livekit_url, livekit_room, livekit_client_token}):
+        the avatar joins the caller's room as a participant (Flow 2).
+        """
         body: dict[str, Any] = {
             "mode": "LITE",
             "avatar_id": avatar_id,
@@ -79,6 +85,8 @@ class LiveAvatarClient:
         }
         if max_session_duration is not None:
             body["max_session_duration"] = max_session_duration
+        if livekit_config is not None:
+            body["livekit_config"] = livekit_config
 
         resp = await self._http.post("/v1/sessions/token", json=body)
         resp.raise_for_status()

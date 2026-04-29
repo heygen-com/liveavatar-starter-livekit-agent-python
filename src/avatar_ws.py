@@ -11,6 +11,7 @@ Outgoing (agent → media server):
 
 from __future__ import annotations
 
+import asyncio
 import audioop
 import base64
 import json
@@ -19,6 +20,7 @@ import uuid
 
 import websockets
 from livekit import rtc
+from websockets.exceptions import ConnectionClosed
 
 logger = logging.getLogger("avatar_ws")
 
@@ -36,6 +38,8 @@ class AvatarWebSocket:
         self._is_speaking = False
         self._first_chunk_sent = False
         self._chunk_size = FIRST_CHUNK_BYTES
+        self._closed = False  # set by close() — disables auto-reconnect.
+        self._reconnect_lock = asyncio.Lock()
 
     @property
     def connected(self) -> bool:
@@ -44,12 +48,15 @@ class AvatarWebSocket:
     async def connect(self) -> None:
         if self.connected:
             return
-        self.ws = await websockets.connect(
-            self.ws_url, ping_interval=30, ping_timeout=10
-        )
+        # ping_interval=None: disable WS-level keepalive. Continuous audio
+        # frames are themselves a liveness signal; some LiveAvatar media
+        # servers stall pong responses under load and the client tears down
+        # the conn (1011 keepalive timeout).
+        self.ws = await websockets.connect(self.ws_url, ping_interval=None)
         logger.info("avatar_ws connected url=%s", self.ws_url)
 
     async def close(self) -> None:
+        self._closed = True
         if self.ws is not None:
             try:
                 await self.ws.close()
@@ -57,11 +64,49 @@ class AvatarWebSocket:
                 logger.warning("avatar_ws close error: %s", e)
             self.ws = None
 
+    async def _reconnect(self) -> None:
+        """Drop the dead socket, open a new one. If the agent is mid-speech,
+        re-emit the `start` message so the new server-side session knows
+        the audio format. In-flight buffered audio is dropped — the next
+        send_audio_frame will repopulate.
+        """
+        async with self._reconnect_lock:
+            if self.connected or self._closed:
+                return
+            logger.info("avatar_ws reconnecting...")
+            self.ws = await websockets.connect(self.ws_url, ping_interval=None)
+            logger.info("avatar_ws reconnected")
+            if self._is_speaking:
+                # New server session: replay the start frame. Reset chunking
+                # so first chunk after reconnect is small (low TTFB).
+                self._first_chunk_sent = False
+                self._chunk_size = FIRST_CHUNK_BYTES
+                await self.ws.send(
+                    json.dumps(
+                        {
+                            "type": "start",
+                            "encoding": "pcm_s16le",
+                            "sample_rate": SAMPLE_RATE,
+                            "channels": 1,
+                        }
+                    )
+                )
+
     async def _send_json(self, msg: dict) -> None:
+        if self._closed:
+            raise RuntimeError("avatar_ws is closed")
         if not self.connected:
             await self.connect()
         assert self.ws is not None
-        await self.ws.send(json.dumps(msg))
+        try:
+            await self.ws.send(json.dumps(msg))
+        except ConnectionClosed as e:
+            logger.warning("avatar_ws send hit ConnectionClosed: %s", e)
+            self.ws = None
+            await self._reconnect()
+            if self.ws is None:
+                raise
+            await self.ws.send(json.dumps(msg))
 
     async def start_speaking(self) -> None:
         if self._is_speaking:
@@ -114,7 +159,7 @@ class AvatarWebSocket:
             self._buffer.clear()
         await self._send_json({"type": "agent.speak_end"})
         self._is_speaking = False
-        logger.debug("avatar_ws finish_speaking")
+        logger.debug("avatar_ws finish sending tts data to ws")
 
     async def interrupt(self) -> None:
         await self._send_json(

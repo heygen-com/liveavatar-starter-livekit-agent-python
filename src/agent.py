@@ -6,8 +6,12 @@ the LiveAvatar media-server WebSocket so the avatar lip-syncs to the response.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from typing import AsyncIterable
+
+WS_CLEANUP_TIMEOUT = 0.5  # seconds — bound interrupt/finish sends so a slow
+# avatar WS doesn't blow the 5s LK Agents speech-cancel budget.
 
 from livekit import rtc
 from livekit.agents import Agent, ModelSettings
@@ -62,13 +66,11 @@ class LiveAvatarAgent(Agent):
                 yield frame
         except asyncio.CancelledError:
             logger.info("tts_node cancelled (interrupt)")
-            try:
-                await self._avatar_ws.interrupt()
-            except Exception as e:
-                logger.warning("avatar_ws interrupt failed: %s", e)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._avatar_ws.interrupt(), WS_CLEANUP_TIMEOUT)
             raise
         finally:
-            try:
-                await self._avatar_ws.finish_speaking()
-            except Exception as e:
-                logger.warning("avatar_ws finish_speaking failed: %s", e)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    self._avatar_ws.finish_speaking(), WS_CLEANUP_TIMEOUT
+                )

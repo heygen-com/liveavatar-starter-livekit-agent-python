@@ -5,7 +5,8 @@ Sequence:
   2. POST /v1/sessions/start   → livekit_url, livekit_agent_token,
                                  livekit_client_token, ws_url
   3. Run AgentServer locally (devmode, unregistered) and dispatch a single
-     job with the pre-minted livekit_agent_token via simulate_job(token=...).
+     job with the pre-minted livekit_agent_token via
+     simulate_job_with_metadata, passing ws_url through job metadata.
   4. The worker entrypoint (agent_dispatcher.my_agent) connects to the
      LiveAvatar room, opens the avatar media-server WebSocket, and starts
      the voice pipeline.
@@ -35,7 +36,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from livekit.protocol import models
 
-from agent_dispatcher import server
+from agent_dispatcher import server, simulate_job_with_metadata
 from liveavatar import LiveAvatarClient
 
 load_dotenv(".env.local")
@@ -53,7 +54,6 @@ def _setup_logging() -> None:
     root.addHandler(handler)
     root.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
 
-    # Quiet down chatty third-party loggers.
     for name in ("livekit", "websockets", "httpcore", "httpx"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
@@ -66,10 +66,8 @@ VIEWER_DIR = Path(__file__).resolve().parent.parent / "viewer"
 
 
 def _serve_viewer() -> tuple[socketserver.TCPServer, int]:
-    """Serve viewer/ on a free localhost port. Returns (httpd, port)."""
-
     class _Quiet(http.server.SimpleHTTPRequestHandler):
-        def log_message(self, *_args):  # silence access logs
+        def log_message(self, *_args):
             pass
 
     handler = functools.partial(_Quiet, directory=str(VIEWER_DIR))
@@ -87,9 +85,6 @@ def _open_viewer(port: int, livekit_url: str, client_token: str) -> str:
 
 
 def _decode_jwt_payload(token: str) -> dict:
-    """Decode a JWT payload (middle segment) without signature verification.
-    Used to read the room name out of the LiveAvatar agent token.
-    """
     parts = token.split(".")
     if len(parts) < 2:
         raise ValueError("invalid jwt")
@@ -131,15 +126,14 @@ async def run() -> None:
     logger.info("agent_token room=%s identity=%s", room_name, payload.get("sub"))
 
     server.update_options(ws_url=started.livekit_url)
-    # The worker subprocess reads this to open the LiveAvatar media-server WS.
-    os.environ["LIVEAVATAR_WS_URL"] = started.ws_url
 
     @server.once("worker_started")
     def _dispatch_job() -> None:
         async def _go() -> None:
-            await server.simulate_job(
+            await simulate_job_with_metadata(
                 room=room_name,
                 token=started.livekit_agent_token,
+                metadata=json.dumps({"ws_url": started.ws_url}),
                 room_info=models.Room(name=room_name, sid="SRM_liveavatar"),
             )
             logger.info("simulate_job dispatched")
