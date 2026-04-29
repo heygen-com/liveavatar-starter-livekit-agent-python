@@ -1,20 +1,24 @@
-"""End-to-end entrypoint for Flow (1): LiveAvatar hosts the LiveKit room.
+"""Demo entrypoint — LiveAvatar-hosted LiveKit room (Flow 1).
+
+LiveAvatar provisions the LiveKit room in their own LK project. We mint a
+session, then run an AgentServer locally (devmode, unregistered) and dispatch
+a single job with the pre-minted agent_token via simulate_job_with_metadata.
+
+Prod path for this flow: skip AgentServer entirely and run a long-lived
+process that calls rtc.Room.connect(livekit_url, agent_token) directly —
+LK Cloud `agent deploy` does NOT work here (foreign LK project).
 
 Sequence:
-  1. POST /v1/sessions/token   → session_token JWT (LiveAvatarClient)
+  1. POST /v1/sessions/token   → session_token JWT
   2. POST /v1/sessions/start   → livekit_url, livekit_agent_token,
                                  livekit_client_token, ws_url
-  3. Run AgentServer locally (devmode, unregistered) and dispatch a single
-     job with the pre-minted livekit_agent_token via
-     simulate_job_with_metadata, passing ws_url through job metadata.
-  4. The worker entrypoint (agent_dispatcher.my_agent) connects to the
-     LiveAvatar room, opens the avatar media-server WebSocket, and starts
-     the voice pipeline.
-  5. A local HTTP server hosts viewer/index.html and the browser auto-opens
-     to it w/ url+client_token preloaded so you can talk to the avatar.
+  3. simulate_job_with_metadata launches the worker entrypoint
+     (worker.my_agent), which connects to the LiveAvatar room, opens the
+     avatar media-server WebSocket, and starts the voice pipeline.
+  4. Local HTTP server hosts viewer/index.html; browser auto-opens with
+     url+client_token preloaded.
 
-Stop with Ctrl-C. The worker drains, the LiveAvatar session is closed, and
-the local viewer server shuts down.
+Stop with Ctrl-C.
 """
 
 from __future__ import annotations
@@ -36,8 +40,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from livekit.protocol import models
 
-from agent_dispatcher import server, simulate_job_with_metadata
-from liveavatar import LiveAvatarClient
+from worker import server, simulate_job_with_metadata
+from liveavatar_client import LiveAvatarClient
 
 load_dotenv(".env.local")
 
@@ -96,10 +100,13 @@ async def run() -> None:
     api_key = os.environ["LIVEAVATAR_API_KEY"]
     avatar_id = os.environ["AVATAR_ID"]
     base_url = os.environ.get("LIVEAVATAR_BASE_URL") or "https://api.liveavatar.com"
+    is_sandbox = os.environ.get("IS_SANDBOX", "true").lower() == "true"
 
     # 1+2. Mint a LiveAvatar session.
     async with LiveAvatarClient(api_key=api_key, base_url=base_url) as la:
-        token_resp = await la.create_session_token(avatar_id=avatar_id)
+        token_resp = await la.create_session_token(
+            avatar_id=avatar_id, is_sandbox=is_sandbox
+        )
         logger.info("session_token created session_id=%s", token_resp.session_id)
 
         started = await la.start_session(token_resp.session_token)

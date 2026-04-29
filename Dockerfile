@@ -1,6 +1,7 @@
 # LiveKit Cloud agent worker image.
-# Builds the same agent_dispatcher.py used in Flow 1 simulate_job, but here
-# it runs as a long-lived registered worker accepting dispatched jobs.
+# Builds src/worker.py to run as a long-lived registered worker accepting
+# dispatched jobs (Flow 2 / BYO LiveKit). The same worker module also serves
+# the liveavatar_hosted_demo.py (Flow 1) in-process simulate_job path.
 
 FROM python:3.13-slim AS base
 
@@ -24,7 +25,7 @@ RUN pip install -e .
 
 # Pre-download VAD + turn detector model weights into the image so cold-start
 # in cloud is fast.
-RUN python src/agent_dispatcher.py download-files
+RUN python src/worker.py download-files
 
 # LK Cloud injects LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET at runtime.
-CMD ["python", "src/agent_dispatcher.py", "start"]
+CMD ["python", "src/worker.py", "start"]

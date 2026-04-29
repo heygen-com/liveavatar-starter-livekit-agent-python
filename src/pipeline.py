@@ -1,9 +1,9 @@
 """Shared voice pipeline + room helpers.
 
-Used by both Flow 1 (main.py via simulate_job_with_metadata) and Flow 2
-(agent_dispatcher.py — registered AgentServer worker). Both run inside an
-AgentServer worker process, so JobContext.inference_executor is available
-to plugins like the multilingual turn detector.
+Used by both demos (liveavatar_hosted_demo.py and byo_livekit_demo.py) via
+the worker.py entrypoint. Both run inside an AgentServer worker process, so
+JobContext.inference_executor is available to plugins like the multilingual
+turn detector.
 """
 
 from __future__ import annotations

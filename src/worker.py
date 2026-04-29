@@ -1,21 +1,21 @@
-"""LiveKit AgentServer wiring.
+"""LiveKit AgentServer worker.
 
 Defines the worker process: prewarm hook (loads VAD), the @server.rtc_session
-entrypoint, and a small `simulate_job_with_metadata` helper used by Flow 1.
+entrypoint, and a small `simulate_job_with_metadata` helper used by the
+LiveAvatar-hosted demo.
 
-Both flows run inside an AgentServer worker subprocess and deliver the
+Both demos run inside an AgentServer worker subprocess and deliver the
 LiveAvatar media-server WS URL through job metadata as a JSON blob:
     {"ws_url": "wss://..."}.
 
-  * Flow 1 — LiveAvatar hosts the LiveKit room.
-    main.py mints a LiveAvatar session, then dispatches a single job to this
-    worker via simulate_job_with_metadata(token=..., metadata=...).
-    Run with `python src/main.py`.
+  * liveavatar_hosted_demo.py (Flow 1) — LiveAvatar hosts the LiveKit room.
+    Mints a LiveAvatar session, then dispatches a single job to this worker
+    in-process via simulate_job_with_metadata(token=..., metadata=...).
 
-  * Flow 2 — we own the LiveKit room.
-    Run this module directly (`python src/agent_dispatcher.py dev`) to
-    register with LiveKit Cloud and accept dispatched jobs by agent_name.
-    example_flow_v2.py drives dispatch via AgentDispatchService.
+  * byo_livekit_demo.py (Flow 2) — we own the LiveKit room.
+    Run this module directly (`python src/worker.py dev`) or deploy it to
+    LK Cloud (`lk agent deploy`) to register and accept dispatched jobs by
+    agent_name. The demo drives dispatch via AgentDispatchService.
 """
 
 from __future__ import annotations
@@ -46,6 +46,8 @@ logger = logging.getLogger("agent")
 load_dotenv(".env.local")
 
 
+AGENT_NAME = "my-agent"
+
 server = AgentServer()
 
 
@@ -56,7 +58,7 @@ def prewarm(proc: JobProcess) -> None:
 server.setup_fnc = prewarm
 
 
-@server.rtc_session(agent_name="my-agent")
+@server.rtc_session(agent_name=AGENT_NAME)
 async def my_agent(ctx: JobContext) -> None:
     ctx.log_context_fields = {"room": ctx.room.name}
 
@@ -99,8 +101,9 @@ async def simulate_job_with_metadata(
 ) -> None:
     """Variant of AgentServer.simulate_job that injects Job.metadata.
 
-    Used by Flow 1 (main.py) so the worker entrypoint can read the LiveAvatar
-    ws_url from `ctx.job.metadata` — same code path as Flow 2 dispatch.
+    Used by liveavatar_hosted_demo.py so the worker entrypoint can read the
+    LiveAvatar ws_url from `ctx.job.metadata` — same code path as real
+    AgentDispatchService dispatch.
 
     Touches a few private AgentServer attrs (`_id`, `_ws_url`, `_proc_pool`).
     Upstream simulate_job builds the Job internally and doesn't expose

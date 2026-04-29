@@ -1,20 +1,21 @@
-"""End-to-end entrypoint for Flow (2): we own the LiveKit room.
+"""Demo entrypoint — BYO (Bring-Your-Own) LiveKit room (Flow 2).
+
+We own the LiveKit room in our own LK Cloud project. The agent is deployed
+to LK Cloud via `lk agent deploy` (or run locally via `python src/worker.py
+dev`) and accepts dispatched jobs by agent_name.
 
 Sequence:
-  1. Mint room name + viewer/avatar tokens against our LK Cloud project.
-  2. POST /v1/sessions/token with livekit_config so the LiveAvatar avatar
-     joins our room as a participant (using the avatar token we minted).
+  1. Mint room name + viewer/avatar tokens against our LK project.
+  2. POST /v1/sessions/token w/ livekit_config so the LiveAvatar avatar joins
+     our room using the avatar token we minted.
   3. POST /v1/sessions/start → ws_url for the avatar media server.
-  4. Create an agent dispatch via livekit.api.AgentDispatchService:
+  4. Create agent dispatch via livekit.api.AgentDispatchService:
         agent_name="my-agent", room=<our room>, metadata={ws_url}
-     The worker (registered with LK Cloud via `lk agent deploy` or running
-     locally via `python src/agent_dispatcher.py dev`) accepts the dispatch
-     and connects to our room.
-  5. A local HTTP server hosts viewer/index.html and the browser auto-opens
-     to it w/ our LIVEKIT_URL + viewer_token preloaded.
+     LK Cloud routes the dispatch to a registered worker.
+  5. Local HTTP server hosts viewer/index.html; browser auto-opens with
+     LIVEKIT_URL + viewer_token preloaded.
 
-Stop with Ctrl-C. The LiveAvatar session is closed; LK Cloud reaps the
-worker job when the room empties.
+Stop with Ctrl-C.
 """
 
 from __future__ import annotations
@@ -37,7 +38,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from livekit import api
 
-from liveavatar import LiveAvatarClient
+from liveavatar_client import LiveAvatarClient
+from worker import AGENT_NAME
 
 load_dotenv(".env.local")
 
@@ -59,11 +61,10 @@ def _setup_logging() -> None:
 
 
 _setup_logging()
-logger = logging.getLogger("flow_v2")
+logger = logging.getLogger("byo_livekit_demo")
 
 
 VIEWER_DIR = Path(__file__).resolve().parent.parent / "viewer"
-AGENT_NAME = "my-agent"
 AVATAR_IDENTITY = "avatar"
 VIEWER_IDENTITY = "viewer"
 TOKEN_TTL_SECONDS = 60 * 60  # 1h
@@ -118,6 +119,7 @@ async def run() -> None:
     api_key = os.environ["LIVEAVATAR_API_KEY"]
     avatar_id = os.environ["AVATAR_ID"]
     base_url = os.environ.get("LIVEAVATAR_BASE_URL") or "https://api.liveavatar.com"
+    is_sandbox = os.environ.get("IS_SANDBOX", "true").lower() == "true"
 
     livekit_url = os.environ["LIVEKIT_URL"]
     lk_key = os.environ["LIVEKIT_API_KEY"]
@@ -137,6 +139,7 @@ async def run() -> None:
     async with LiveAvatarClient(api_key=api_key, base_url=base_url) as la:
         token_resp = await la.create_session_token(
             avatar_id=avatar_id,
+            is_sandbox=is_sandbox,
             livekit_config={
                 "livekit_url": livekit_url,
                 "livekit_room": room_name,
