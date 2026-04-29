@@ -89,7 +89,11 @@ class LiveAvatarClient:
             body["livekit_config"] = livekit_config
 
         resp = await self._http.post("/v1/sessions/token", json=body)
-        resp.raise_for_status()
+        if resp.is_error:
+            raise RuntimeError(
+                f"create_session_token failed status={resp.status_code} "
+                f"body={resp.text!r} request_body={body!r}"
+            )
         data = resp.json()["data"]
         return SessionToken(
             session_id=data["session_id"],
@@ -116,14 +120,26 @@ class LiveAvatarClient:
 
     async def stop_session(
         self,
-        session_token: str,
         *,
         session_id: str,
+        session_token: str | None = None,
         reason: str = "USER_CLOSED",
     ) -> None:
+        """Stop a session.
+
+        Auth modes:
+          * API key (default) — uses the X-API-KEY header set on the client.
+            Lets a process holding only the API key (e.g. the worker shutdown
+            hook) close any session by id.
+          * Bearer session_token — pass `session_token` to use the per-session
+            JWT instead. Useful when the caller doesn't have the API key.
+        """
+        headers = (
+            {"Authorization": f"Bearer {session_token}"} if session_token else {}
+        )
         resp = await self._http.post(
             "/v1/sessions/stop",
-            headers={"Authorization": f"Bearer {session_token}"},
+            headers=headers,
             json={"session_id": session_id, "reason": reason},
         )
         resp.raise_for_status()

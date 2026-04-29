@@ -4,9 +4,13 @@ Defines the worker process: prewarm hook (loads VAD), the @server.rtc_session
 entrypoint, and a small `simulate_job_with_metadata` helper used by the
 LiveAvatar-hosted demo.
 
-Both demos run inside an AgentServer worker subprocess and deliver the
-LiveAvatar media-server WS URL through job metadata as a JSON blob:
-    {"ws_url": "wss://..."}.
+Both demos run inside an AgentServer worker subprocess and deliver session
+context through job metadata as a JSON blob:
+    {"ws_url": "wss://...", "session_id": "..."}
+The worker uses session_id (plus the LIVEAVATAR_API_KEY env var) to call
+stop_session on shutdown, so the LiveAvatar session is closed whenever the
+job ends — room empty, agent shutdown, dispatch cancel, normal SIGTERM.
+(SIGKILL still cannot be intercepted; for that, set a server-side TTL.)
 
   * liveavatar_hosted_demo.py (Flow 1) — LiveAvatar hosts the LiveKit room.
     Mints a LiveAvatar session, then dispatches a single job to this worker
@@ -22,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 
 from dotenv import load_dotenv
 from livekit import api as lkapi
@@ -33,6 +38,7 @@ from livekit.protocol import models
 
 from agent import LiveAvatarAgent
 from avatar_ws import AvatarWebSocket
+from liveavatar_client import LiveAvatarClient
 from pipeline import (
     build_room_options,
     build_session,
@@ -75,10 +81,39 @@ async def my_agent(ctx: JobContext) -> None:
     ws_url = meta.get("ws_url")
     if not ws_url:
         raise RuntimeError("Job metadata missing 'ws_url'.")
+    session_id = meta.get("session_id")
 
     avatar_ws = AvatarWebSocket(ws_url=ws_url)
     await avatar_ws.connect()
     ctx.add_shutdown_callback(avatar_ws.close)
+
+    # Close the LiveAvatar session whenever the job ends. Covers normal
+    # shutdown paths (room empty, dispatch cancel, SIGTERM, exceptions);
+    # SIGKILL bypasses this — fall back to a server-side TTL there.
+    api_key = os.environ.get("LIVEAVATAR_API_KEY")
+    base_url = os.environ.get("LIVEAVATAR_BASE_URL") or "https://api.liveavatar.com"
+    if session_id and api_key:
+        async def _stop_liveavatar_session() -> None:
+            try:
+                async with LiveAvatarClient(
+                    api_key=api_key, base_url=base_url
+                ) as la:
+                    await la.stop_session(session_id=session_id)
+                logger.info("liveavatar session stopped session_id=%s", session_id)
+            except Exception as e:
+                logger.warning("stop_session failed session_id=%s: %s", session_id, e)
+
+        ctx.add_shutdown_callback(_stop_liveavatar_session)
+    elif not session_id:
+        logger.warning(
+            "metadata missing session_id; LiveAvatar session will not be "
+            "closed by the worker on shutdown."
+        )
+    elif not api_key:
+        logger.warning(
+            "LIVEAVATAR_API_KEY not set on worker; LiveAvatar session will "
+            "not be closed by the worker on shutdown."
+        )
 
     session = build_session(ctx.proc.userdata["vad"])
     wire_session_observability(session)

@@ -140,7 +140,9 @@ async def run() -> None:
             await simulate_job_with_metadata(
                 room=room_name,
                 token=started.livekit_agent_token,
-                metadata=json.dumps({"ws_url": started.ws_url}),
+                metadata=json.dumps(
+                    {"ws_url": started.ws_url, "session_id": started.session_id}
+                ),
                 room_info=models.Room(name=room_name, sid="SRM_liveavatar"),
             )
             logger.info("simulate_job dispatched")
@@ -183,11 +185,12 @@ async def run() -> None:
 
         httpd.shutdown()
 
+        # Belt-and-suspenders: worker.my_agent registers its own
+        # shutdown callback to stop the LiveAvatar session, so this is
+        # usually redundant. Kept in case the worker shutdown path fails.
         async with LiveAvatarClient(api_key=api_key, base_url=base_url) as la:
             try:
-                await la.stop_session(
-                    token_resp.session_token, session_id=started.session_id
-                )
+                await la.stop_session(session_id=started.session_id)
             except Exception as e:
                 logger.warning("stop_session failed: %s", e)
 

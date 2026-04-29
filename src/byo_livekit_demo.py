@@ -165,7 +165,9 @@ async def run() -> None:
     viewer_url = _open_viewer(port, livekit_url, viewer_token)
     logger.info("viewer opened: %s", viewer_url)
 
-    # 4. Dispatch agent into our room with ws_url in metadata.
+    # 4. Dispatch agent into our room. Metadata carries ws_url + session_id
+    #    so the worker can both drive the avatar and close the LiveAvatar
+    #    session in its shutdown callback.
     lkapi = api.LiveKitAPI(url=livekit_url, api_key=lk_key, api_secret=lk_secret)
     try:
         from livekit.protocol.agent_dispatch import CreateAgentDispatchRequest
@@ -174,7 +176,9 @@ async def run() -> None:
             CreateAgentDispatchRequest(
                 agent_name=AGENT_NAME,
                 room=room_name,
-                metadata=json.dumps({"ws_url": started.ws_url}),
+                metadata=json.dumps(
+                    {"ws_url": started.ws_url, "session_id": started.session_id}
+                ),
             )
         )
         logger.info("dispatch created id=%s", getattr(dispatch, "id", "?"))
@@ -192,11 +196,14 @@ async def run() -> None:
         await stop.wait()
     finally:
         httpd.shutdown()
+        # Belt-and-suspenders: worker.my_agent registers its own
+        # shutdown callback to stop the LiveAvatar session. In real prod
+        # the dispatcher script exits right after create_dispatch, so the
+        # worker's callback is the load-bearing one. Kept here so Ctrl-C
+        # in the demo guarantees cleanup regardless of worker state.
         async with LiveAvatarClient(api_key=api_key, base_url=base_url) as la:
             try:
-                await la.stop_session(
-                    token_resp.session_token, session_id=started.session_id
-                )
+                await la.stop_session(session_id=started.session_id)
                 logger.info("liveavatar session stopped")
             except Exception as e:
                 logger.warning("stop_session failed: %s", e)
